@@ -1,24 +1,16 @@
 import Foundation
-
+public struct LiveUpdateStats:Sendable{public let anchors:Int;public let beforeCount:Int;public let afterCount:Int;public var delta:Int{afterCount-beforeCount}}
 public actor IndexManager {
-    private let scanner = FileScanner()
-    private let engine = SearchEngine()
-    private(set) public var isIndexing = false
-    private(set) public var indexedCount = 0
-
-    public init() {}
-
-    public func rebuild(root: URL, limit: Int? = nil) async {
-        isIndexing = true
-        let records = await Task.detached(priority: .userInitiated) {
-            FileScanner().scan(root: root, limit: limit)
-        }.value
-        engine.replaceIndex(with: records)
-        indexedCount = records.count
-        isIndexing = false
-    }
-
-    public func search(_ query: String, limit: Int = 100) async -> [SearchResult] {
-        engine.search(query, limit: limit)
-    }
+    private let engine=SearchEngine(); private var storage=IndexStorage(); private var recordsByPath:[String:FileRecord]=[:]
+    private(set) public var isIndexing=false; private(set) public var indexedCount=0
+    public init(){}
+    public var storagePath:String{storage.baseURL.path}; public var storageSizeBytes:UInt64{storage.sizeBytes()}; public var storageExists:Bool{storage.exists}; public var persistedInfo:PersistedIndexInfo?{storage.info()}
+    public func useStorageDirectory(_ url:URL){storage=IndexStorage(baseURL:url.standardizedFileURL)}
+    @discardableResult public func loadPersisted(root:URL,progress:(@Sendable(IndexProgress)->Void)?=nil)async->Bool{progress?(IndexProgress(phase:.loading,completed:0,currentPath:storage.baseURL.path));guard let records=try?storage.load(root:root)else{return false};recordsByPath=Dictionary(uniqueKeysWithValues:records.map{($0.path,$0)});progress?(IndexProgress(phase:.building,completed:0,total:records.count));engine.replaceIndex(with:records){d,t in progress?(IndexProgress(phase:.building,completed:d,total:t))};indexedCount=records.count;progress?(IndexProgress(phase:.ready,completed:records.count,total:records.count));return true}
+    public func rebuild(root:URL,limit:Int?=nil,progress:(@Sendable(IndexProgress)->Void)?=nil)async{isIndexing=true;let records=await Task.detached(priority:.userInitiated){FileScanner().scan(root:root,limit:limit){c,p in progress?(IndexProgress(phase:.scanning,completed:c,currentPath:p))}}.value;recordsByPath=Dictionary(uniqueKeysWithValues:records.map{($0.path,$0)});engine.replaceIndex(with:records){d,t in progress?(IndexProgress(phase:.building,completed:d,total:t))};indexedCount=records.count;progress?(IndexProgress(phase:.saving,completed:records.count,total:records.count,currentPath:storage.baseURL.path));try?storage.save(records:records,root:root);isIndexing=false;progress?(IndexProgress(phase:.ready,completed:records.count,total:records.count,currentPath:storage.baseURL.path))}
+    public func clearPersisted(){try?storage.clear()}
+    @discardableResult public func applyFileSystemChanges(paths:[String],root:URL)async->LiveUpdateStats{guard !paths.isEmpty else{return .init(anchors:0,beforeCount:indexedCount,afterCount:indexedCount)};let rp=root.standardizedFileURL.path,before=recordsByPath.count,anchors=reconciliationAnchors(for:paths,rootPath:rp);let snapshots=await Task.detached(priority:.utility){let s=FileScanner(),f=FileManager.default;var result:[(String,[FileRecord])]=[];for a in anchors{var d:ObjCBool=false;guard f.fileExists(atPath:a,isDirectory:&d),d.boolValue else{result.append((a,[]));continue};let u=URL(fileURLWithPath:a,isDirectory:true);var r:[FileRecord]=[];if a != rp,let x=s.record(for:u){r.append(x)};r.append(contentsOf:s.scan(root:u));result.append((a,r))};return result}.value;for(a,_)in snapshots{removeSubtree(a)};for(_,rs)in snapshots{for r in rs{recordsByPath[r.path]=r}};let all=Array(recordsByPath.values);engine.replaceIndex(with:all);indexedCount=all.count;try?storage.save(records:all,root:root);return .init(anchors:anchors.count,beforeCount:before,afterCount:all.count)}
+    public func search(_ query:String,limit:Int=100)async->(results:[SearchResult],diagnostics:SearchDiagnostics){let r=engine.search(query,limit:limit);return(r,engine.lastDiagnostics)}
+    private func reconciliationAnchors(for paths:[String],rootPath:String)->[String]{let fm=FileManager.default;var a=Set<String>();for raw in paths{let s=URL(fileURLWithPath:raw).standardizedFileURL.path;guard s==rootPath||s.hasPrefix(rootPath+"/")else{continue};var d:ObjCBool=false;if fm.fileExists(atPath:s,isDirectory:&d),d.boolValue{a.insert(s)}else{a.insert(URL(fileURLWithPath:s).deletingLastPathComponent().standardizedFileURL.path)}};let sorted=a.sorted{$0.count<$1.count};var c:[String]=[];for x in sorted{if c.contains(where:{x==$0||x.hasPrefix($0+"/")}){continue};c.append(x)};return c}
+    private func removeSubtree(_ path:String){let p=path.hasSuffix("/") ? path:path+"/";for k in recordsByPath.keys.filter({$0==path||$0.hasPrefix(p)}){recordsByPath.removeValue(forKey:k)}}
 }

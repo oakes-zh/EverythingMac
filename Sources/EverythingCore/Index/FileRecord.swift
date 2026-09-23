@@ -1,9 +1,12 @@
 import Foundation
 
-public struct FileRecord: Identifiable, Hashable, Sendable {
+public struct FileRecord: Identifiable, Hashable, Sendable, Codable {
     public let id: UInt64
     public let name: String
     public let normalizedName: String
+    public let pinyinName: String
+    public let pinyinCompact: String
+    public let pinyinInitials: String
     public let path: String
     public let normalizedPath: String
     public let fileExtension: String
@@ -16,6 +19,9 @@ public struct FileRecord: Identifiable, Hashable, Sendable {
         id: UInt64,
         name: String,
         normalizedName: String,
+        pinyinName: String = "",
+        pinyinCompact: String = "",
+        pinyinInitials: String = "",
         path: String,
         normalizedPath: String,
         fileExtension: String,
@@ -27,6 +33,9 @@ public struct FileRecord: Identifiable, Hashable, Sendable {
         self.id = id
         self.name = name
         self.normalizedName = normalizedName
+        self.pinyinName = pinyinName
+        self.pinyinCompact = pinyinCompact
+        self.pinyinInitials = pinyinInitials
         self.path = path
         self.normalizedPath = normalizedPath
         self.fileExtension = fileExtension

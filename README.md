@@ -1,43 +1,49 @@
-# EverythingMac
+# EverythingMac v0.2.7 — Debug Index Loader + Bounded Search
 
-A native macOS file-search prototype focused on fast local indexing and fuzzy filename search.
+This build is focused on the million-item debugging workflow.
 
-## Current milestone (v0.1 core)
+## Startup behavior
 
-- Recursive home-folder scan
-- In-memory index
-- Exact, prefix, contains, and subsequence fuzzy matching
-- Ranking by match quality + basic recency
-- Query filters: `ext:`, `path:`, `kind:`, `size:>`, `size:<`, `modified:today`, `modified:<7d`
-- SwiftUI macOS search window
-- Double-click to open; context menu to reveal in Finder
-- 25 ms query debounce
+`swift run EverythingMac` no longer scans or rebuilds the filesystem automatically.
+The window opens in **Index Session** mode with three explicit actions:
 
-## Run on macOS
+- **Load Existing Index** — loads `~/Library/Application Support/EverythingMac` by default.
+- **Choose Index Folder…** — point the app at another existing EverythingMac index root.
+- **Build New Index** — explicitly start a filesystem scan/rebuild.
+
+Loading an existing v0.2.6 index does **not** rescan the filesystem. It does rebuild the in-memory search engine from the persisted records, and that stage has visible progress.
+
+## Search changes
+
+- Filename/folder-name only. File contents are never searched.
+- `.glb` is recognized as an extension lookup and uses a dedicated extension index.
+- Chinese two-character terms such as `模型` use a 2-gram candidate index.
+- 3+ character terms use 3-gram postings.
+- Normal query paths are capped at 20,000 candidates instead of walking ~1.1M records.
+- Old query tasks are cancelled and stale generations are forbidden from updating the UI.
+- The status bar shows route, candidate count, checked count, and whether the candidate set was capped.
+- Expensive FSEvents full-engine reconciliation is disabled by default in this debug build; it was able to block searches for minutes on a million-item index.
+
+## Existing index
+
+Default index root:
+
+`~/Library/Application Support/EverythingMac`
+
+A v0.2.6 `records.plist` can be loaded directly; no rebuild is required.
+
+## Run
 
 ```bash
-cd EverythingMac
 swift run EverythingMac
 ```
 
-For a polished app bundle, open `Package.swift` in Xcode and run the `EverythingMac` executable target.
+Then click **Load Existing Index**. Wait until **Search ready** before testing queries.
 
-## Examples
+Useful checks:
 
-```text
-report
-prd rpt
-ext:pdf report
-kind:image sunset
-path:Downloads invoice
-size:>100mb
-modified:<7d ext:fig dashboard
-```
+- `.glb` → route should show `extension`
+- `模型` → route should show `bigram` (unless it is an exact-name hit)
+- `report` → route should show `trigram`
 
-## Next milestone
-
-1. FSEvents incremental updates
-2. SQLite persistence and fast startup
-3. Incremental query cache / previous-result narrowing
-4. Global hotkey and Quick Look
-5. Benchmark harness for 100K / 1M / 3M synthetic records
+Core tests: 9 tests, 0 failures.
