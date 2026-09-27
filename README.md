@@ -47,3 +47,31 @@ Useful checks:
 - `report` → route should show `trigram`
 
 Core tests: 9 tests, 0 failures.
+
+## v0.2.10 Performance Baseline
+- Branched from v0.2.7.1 fast search core; v0.2.8 persistent posting-list changes are intentionally excluded.
+- Per-query profiler: route, candidates, checked, lookup/match/rank/total latency.
+- Debug guard: queries over 100 ms are marked Slow; accidental full-record scans are marked FULL SCAN.
+- Filename/folder-name only. Paths are display/filter data only; no file-content search.
+
+
+## v0.2.10 Fast-path Ranking
+- Pure extension queries stop after enough guaranteed matches; no generic name matching/ranking across the full extension posting list.
+- General candidate ranking changed from repeated bounded insertion (O(candidates × limit)) to append-once + sort-once.
+- Keeps v0.2.9/v0.2.7.1 exact, bigram, trigram and extension lookup routes intact.
+- Debug diagnostics remain enabled for regression detection.
+
+## v0.3.0 Binary Records Index
+- Keeps the v0.2.10 SearchEngine hot path unchanged.
+- Adds `index/records.bin` as the primary record store with a compact versioned binary codec.
+- Existing v0.2.x `records.plist` remains readable. The first load migrates it to `records.bin`; subsequent launches prefer the binary file.
+- This release deliberately does **not** persist/replace posting lists yet: query performance stays on the proven v0.2.10 engine while startup record decoding is isolated for measurement.
+- During the first migration, disk usage temporarily includes both the old plist and the new binary file. Keep the plist until the binary load has been verified on your real index.
+
+## v0.3.1 — Persistent Search Postings
+
+- Keeps the v0.2.10 query hot paths unchanged.
+- Persists the built exact/prefix/bigram/trigram/character/extension posting tables to `index/search-postings.bin`.
+- The first load after upgrading is a one-time migration: existing records are loaded, postings are built, then saved.
+- Subsequent loads restore postings directly instead of walking every filename to rebuild the search index.
+- If the posting snapshot is missing, corrupt, or its record count differs, EverythingMac safely rebuilds it.

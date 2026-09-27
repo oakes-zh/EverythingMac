@@ -242,6 +242,7 @@ final class SearchModel {
     var searchLatencyMS:Double=0; var indexPhase:IndexPhase = .idle; var progressCompleted=0; var progressTotal:Int?; var currentIndexPath=""
     var indexStoragePath=""; var indexStorageBytes:UInt64=0; var showIndexDetails=false; var sessionStarted=false; var searchReady=false
     var candidateCount=0; var examinedCount=0; var searchRoute="idle"; var candidateTruncated=false
+    var lookupMS=0.0; var matchMS=0.0; var rankMS=0.0; var slowQuery=false; var fullScan=false
     private let index=IndexManager(); private var searchTask:Task<Void,Never>?; private var queryGeneration=0
     private var fileEventTask:Task<Void,Never>?; private var monitor:FSEventMonitor?; private var pendingFileEventPaths=Set<String>(); private var liveChangeBatches=0
 
@@ -285,6 +286,7 @@ final class SearchModel {
         guard !Task.isCancelled, generation == nil || generation==queryGeneration, value==query else{return}
         searchLatencyMS=Double(start.duration(to:clock.now).components.attoseconds)/1_000_000_000_000_000
         candidateCount=response.diagnostics.candidateCount;examinedCount=response.diagnostics.examinedCount;searchRoute=response.diagnostics.route;candidateTruncated=response.diagnostics.truncated
+        lookupMS=response.diagnostics.lookupMS;matchMS=response.diagnostics.matchMS;rankMS=response.diagnostics.rankMS;fullScan=response.diagnostics.fullScan;slowQuery=response.diagnostics.totalMS > 100
         results=response.results;if let selectedID,results.contains(where:{$0.id==selectedID}){return};selectedID=results.first?.id
     }
     func moveSelection(_ d:Int){guard !results.isEmpty else{return};let c=selectedID.flatMap{id in results.firstIndex(where:{$0.id==id})} ?? 0;selectedID=results[min(max(c+d,0),results.count-1)].id}
@@ -360,9 +362,12 @@ struct ContentView: View {
                     HStack(spacing: 5) { Image(systemName: "externaldrive.fill"); Text(model.status) }
                 }.buttonStyle(.plain)
                 Spacer()
-                Text(String(format: "%.1f ms", model.searchLatencyMS))
+                if model.fullScan { Text("⚠ FULL SCAN").foregroundStyle(.red).fontWeight(.bold) }
+                else if model.slowQuery { Text(String(format: "⚠ Slow %.1f ms", model.searchLatencyMS)).foregroundStyle(.orange).fontWeight(.semibold) }
+                else { Text(String(format: "%.1f ms", model.searchLatencyMS)) }
                 Text("\(model.results.count) results")
                 Text("\(model.searchRoute) • \(model.candidateCount.formatted()) cand • \(model.examinedCount.formatted()) checked" + (model.candidateTruncated ? " • capped" : ""))
+                Text(String(format: "lookup %.2f • match %.2f • rank %.2f ms", model.lookupMS, model.matchMS, model.rankMS))
                 Text("⌥Space summon  ↑↓ select  ↩ open  ⌘↩ reveal  ⌘Y preview")
             }
             .font(.caption)

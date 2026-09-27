@@ -12,6 +12,11 @@ public struct SearchDiagnostics: Sendable {
     public let examinedCount: Int
     public let truncated: Bool
     public let route: String
+    public let lookupMS: Double
+    public let matchMS: Double
+    public let rankMS: Double
+    public let totalMS: Double
+    public let fullScan: Bool
 }
 
 /// Indexed, filename-only search engine. No file contents are indexed or searched.
@@ -24,11 +29,38 @@ public final class SearchEngine: @unchecked Sendable {
     private var grams: [String: [Int]] = [:]
     private var charIndex: [Character: [Int]] = [:]
     private var extensionIndex: [String: [Int]] = [:]
-    public private(set) var lastDiagnostics = SearchDiagnostics(totalEntries: 0, candidateCount: 0, examinedCount: 0, truncated: false, route: "idle")
+    public private(set) var lastDiagnostics = SearchDiagnostics(totalEntries: 0, candidateCount: 0, examinedCount: 0, truncated: false, route: "idle", lookupMS: 0, matchMS: 0, rankMS: 0, totalMS: 0, fullScan: false)
     private let maxCandidates = 20_000
 
     public init(records: [FileRecord] = []) { replaceIndex(with: records) }
     public var count: Int { records.count }
+
+    /// v0.3.1: restore the already-built posting tables instead of rebuilding them
+    /// from every filename on every launch. Records remain the source of result metadata.
+    @discardableResult
+    public func loadPersistentPostings(records: [FileRecord], from url: URL) -> Bool {
+        do {
+            let snapshot = try PersistentPostingCodec.read(from: url)
+            guard snapshot.recordCount == records.count else { return false }
+            self.records = records
+            self.exact = snapshot.exact
+            self.prefix1 = snapshot.prefix1
+            self.prefix2 = snapshot.prefix2
+            self.grams = snapshot.grams
+            self.charIndex = snapshot.charIndex
+            self.extensionIndex = snapshot.extensionIndex
+            return true
+        } catch { return false }
+    }
+
+    public func savePersistentPostings(to url: URL) throws {
+        try PersistentPostingCodec.write(
+            recordCount: records.count,
+            exact: exact, prefix1: prefix1, prefix2: prefix2,
+            grams: grams, charIndex: charIndex, extensionIndex: extensionIndex,
+            to: url
+        )
+    }
 
     public func replaceIndex(with records: [FileRecord], progress: (@Sendable (Int, Int) -> Void)? = nil) {
         self.records = records
@@ -75,7 +107,11 @@ public final class SearchEngine: @unchecked Sendable {
             let ext = String(text.dropFirst()).lowercased()
             if !ext.isEmpty { implicitExtension = ext; text = "" }
         }
+        let clock = ContinuousClock(); let totalStart = clock.now
+        let lookupStart = clock.now
         let selection = candidateIndices(for: text, explicitExtension: parsed.fileExtension ?? implicitExtension)
+        let lookupMS = milliseconds(lookupStart.duration(to: clock.now))
+        let matchStart = clock.now
         var out: [SearchResult] = []; out.reserveCapacity(min(limit, 128)); var examined = 0
         for i in selection.ids.prefix(maxCandidates) {
             if Task.isCancelled { break }
@@ -88,10 +124,21 @@ public final class SearchEngine: @unchecked Sendable {
             if text.isEmpty { score = 8_000 }
             else if let s = nameScore(text, record: record) { score = s }
             else { continue }
-            insertBounded(SearchResult(record: record, score: score), into: &out, limit: limit)
+            out.append(SearchResult(record: record, score: score))
+            // Pure extension queries are guaranteed matches. Once we have enough rows,
+            // stop instead of running ranking work across every file with that extension.
+            if text.isEmpty, parsed.pathContains == nil, parsed.kind == nil, parsed.minimumSize == nil, parsed.maximumSize == nil, parsed.modifiedAfter == nil, out.count >= limit { break }
         }
+        let matchMS = milliseconds(matchStart.duration(to: clock.now))
+        let rankStart = clock.now
+        // Candidate retrieval already provides a bounded set. Sort once rather than doing
+        // O(candidates × limit) bounded insertion with expensive localized path compares.
         out.sort(by: resultOrder)
-        lastDiagnostics = SearchDiagnostics(totalEntries: records.count, candidateCount: selection.ids.count, examinedCount: examined, truncated: selection.ids.count > maxCandidates, route: selection.route)
+        if out.count > limit { out.removeSubrange(limit..<out.count) }
+        let rankMS = milliseconds(rankStart.duration(to: clock.now))
+        let totalMS = milliseconds(totalStart.duration(to: clock.now))
+        let fullScan = examined >= records.count && records.count > 10_000
+        lastDiagnostics = SearchDiagnostics(totalEntries: records.count, candidateCount: selection.ids.count, examinedCount: examined, truncated: selection.ids.count > maxCandidates, route: selection.route, lookupMS: lookupMS, matchMS: matchMS, rankMS: rankMS, totalMS: totalMS, fullScan: fullScan)
         return out
     }
 
@@ -159,8 +206,57 @@ public final class SearchEngine: @unchecked Sendable {
         if let k=q.kind { switch k { case .folder:if !r.isDirectory{return false};case .file:if r.isDirectory{return false};case .image:if !["png","jpg","jpeg","gif","webp","heic","tiff","svg"].contains(r.fileExtension){return false};case .video:if !["mp4","mov","m4v","avi","mkv","webm"].contains(r.fileExtension){return false};case .audio:if !["mp3","m4a","wav","aac","flac","aiff"].contains(r.fileExtension){return false};case .document:if !["pdf","doc","docx","txt","md","rtf","pages","xls","xlsx","ppt","pptx"].contains(r.fileExtension){return false} } }
         return true
     }
+    private func milliseconds(_ d: Duration) -> Double {
+        let c = d.components
+        return Double(c.seconds) * 1000 + Double(c.attoseconds) / 1_000_000_000_000_000
+    }
     private func uniqueSorted(_ a:[Int])->[Int]{Array(Set(a)).sorted()}
     private func intersectSorted(_ a:[Int],_ b:[Int],cap:Int)->[Int]{var i=0,j=0,o:[Int]=[];o.reserveCapacity(min(min(a.count,b.count),cap));while i<a.count&&j<b.count&&o.count<cap{if a[i]==b[j]{o.append(a[i]);i+=1;j+=1}else if a[i]<b[j]{i+=1}else{j+=1}};return o}
-    private func insertBounded(_ r:SearchResult,into top:inout[SearchResult],limit:Int){guard limit>0 else{return};if top.count<limit{top.append(r);return};guard let w=top.indices.min(by:{resultOrder(top[$0],top[$1])})else{return};if resultOrder(r,top[w]){top[w]=r}}
     private func resultOrder(_ a:SearchResult,_ b:SearchResult)->Bool{if a.score != b.score{return a.score>b.score};if a.record.name.count != b.record.name.count{return a.record.name.count<b.record.name.count};if a.record.isDirectory != b.record.isDirectory{return a.record.isDirectory};return a.record.path.localizedStandardCompare(b.record.path) == .orderedAscending}
+}
+
+
+private enum PersistentPostingCodec {
+    static let magic = Data([0x45,0x56,0x4d,0x50,0x4f,0x53,0x54,0x31]) // EVMPOST1
+    static let version: UInt32 = 1
+    struct Snapshot {
+        let recordCount: Int
+        let exact, prefix1, prefix2, grams, extensionIndex: [String:[Int]]
+        let charIndex: [Character:[Int]]
+    }
+    enum CodecError: Error { case corrupt, badMagic, badVersion }
+
+    static func write(recordCount: Int, exact:[String:[Int]], prefix1:[String:[Int]], prefix2:[String:[Int]], grams:[String:[Int]], charIndex:[Character:[Int]], extensionIndex:[String:[Int]], to url:URL) throws {
+        var d=Data(); d.reserveCapacity(max(4096, recordCount * 32)); d.append(magic); append(version,to:&d); append(UInt64(recordCount),to:&d)
+        writeMap(exact,to:&d); writeMap(prefix1,to:&d); writeMap(prefix2,to:&d); writeMap(grams,to:&d)
+        writeMap(Dictionary(uniqueKeysWithValues: charIndex.map { (String($0.key), $0.value) }),to:&d)
+        writeMap(extensionIndex,to:&d)
+        try FileManager.default.createDirectory(at:url.deletingLastPathComponent(),withIntermediateDirectories:true)
+        try d.write(to:url,options:.atomic)
+    }
+    static func read(from url:URL) throws -> Snapshot {
+        let d=try Data(contentsOf:url,options:.mappedIfSafe); var r=Reader(data:d)
+        guard try r.bytes(magic.count)==magic else { throw CodecError.badMagic }
+        guard try r.u32()==version else { throw CodecError.badVersion }
+        let n=try r.u64(); guard n <= UInt64(Int.max) else { throw CodecError.corrupt }
+        let exact=try r.map(), p1=try r.map(), p2=try r.map(), grams=try r.map(), chars=try r.map(), ext=try r.map()
+        var ci:[Character:[Int]]=[:]; ci.reserveCapacity(chars.count)
+        for (k,v) in chars { guard k.count==1, let c=k.first else { throw CodecError.corrupt }; ci[c]=v }
+        return Snapshot(recordCount:Int(n),exact:exact,prefix1:p1,prefix2:p2,grams:grams,extensionIndex:ext,charIndex:ci)
+    }
+    static func writeMap(_ m:[String:[Int]],to d:inout Data) {
+        append(UInt32(m.count),to:&d)
+        for (k,v) in m { writeString(k,to:&d); append(UInt32(v.count),to:&d); for x in v { append(UInt32(x),to:&d) } }
+    }
+    static func writeString(_ s:String,to d:inout Data) { let b=Data(s.utf8); append(UInt32(b.count),to:&d); d.append(b) }
+    static func append<T:FixedWidthInteger>(_ x:T,to d:inout Data) { var v=x.littleEndian; withUnsafeBytes(of:&v){d.append(contentsOf:$0)} }
+    struct Reader {
+        let data:Data; var offset=0
+        mutating func bytes(_ n:Int)throws->Data { guard n>=0,offset<=data.count-n else{throw CodecError.corrupt};defer{offset+=n};return data.subdata(in:offset..<offset+n) }
+        mutating func u32()throws->UInt32 { try integer(UInt32.self) }
+        mutating func u64()throws->UInt64 { try integer(UInt64.self) }
+        mutating func integer<T:FixedWidthInteger>(_ t:T.Type)throws->T { let n=MemoryLayout<T>.size;guard offset<=data.count-n else{throw CodecError.corrupt};var v:T=0;_=withUnsafeMutableBytes(of:&v){data.copyBytes(to:$0,from:offset..<offset+n)};offset+=n;return T(littleEndian:v) }
+        mutating func string()throws->String { let n=Int(try u32());let b=try bytes(n);guard let s=String(data:b,encoding:.utf8)else{throw CodecError.corrupt};return s }
+        mutating func map()throws->[String:[Int]] { let count=Int(try u32());var m:[String:[Int]]=[:];m.reserveCapacity(count);for _ in 0..<count{let k=try string();let n=Int(try u32());var a:[Int]=[];a.reserveCapacity(n);for _ in 0..<n{a.append(Int(try u32()))};m[k]=a};return m }
+    }
 }

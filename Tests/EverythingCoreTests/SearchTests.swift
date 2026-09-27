@@ -110,3 +110,49 @@ final class SearchTests: XCTestCase {
         )
     }
 }
+
+extension SearchTests {
+    func testLargeExtensionPostingStopsAtLimit() {
+        let records = (0..<1500).map { i in
+            record(UInt64(i + 1), "file\(i).doc")
+        }
+        let engine = SearchEngine(records: records)
+        let results = engine.search(".doc", limit: 200)
+        XCTAssertEqual(results.count, 200)
+        XCTAssertEqual(engine.lastDiagnostics.route, "extension")
+        XCTAssertLessThanOrEqual(engine.lastDiagnostics.examinedCount, 200)
+    }
+}
+
+extension SearchTests {
+    func testBinaryIndexRoundTrip() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let storage = IndexStorage(baseURL: base)
+        let input = [record(1, "模型.glb"), record(2, "report.pdf")]
+        try storage.save(records: input, root: URL(fileURLWithPath: "/tmp"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: base.appendingPathComponent("index/records.bin").path))
+        XCTAssertEqual(storage.preferredFormat, .binary)
+        let output = try XCTUnwrap(storage.load(root: URL(fileURLWithPath: "/tmp")))
+        XCTAssertEqual(output, input)
+    }
+}
+
+extension SearchTests {
+    func testPersistentPostingsRoundTripPreservesFastRoutes() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let url = base.appendingPathComponent("search-postings.bin")
+        let input = [record(1, "body.glb"), record(2, "模型.glb"), record(3, "report.doc")]
+        let source = SearchEngine(records: input)
+        try source.savePersistentPostings(to: url)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+
+        let restored = SearchEngine()
+        XCTAssertTrue(restored.loadPersistentPostings(records: input, from: url))
+        XCTAssertEqual(restored.search(".glb").count, 2)
+        XCTAssertEqual(restored.lastDiagnostics.route, "extension")
+        XCTAssertEqual(restored.search("模型").first?.record.name, "模型.glb")
+        XCTAssertEqual(restored.lastDiagnostics.route, "bigram")
+    }
+}
