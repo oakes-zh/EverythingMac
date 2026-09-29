@@ -75,3 +75,9 @@ Core tests: 9 tests, 0 failures.
 - The first load after upgrading is a one-time migration: existing records are loaded, postings are built, then saved.
 - Subsequent loads restore postings directly instead of walking every filename to rebuild the search index.
 - If the posting snapshot is missing, corrupt, or its record count differs, EverythingMac safely rebuilds it.
+
+## v0.3.2 — Apple-style UI refresh
+- UI-only release based on v0.3.1 persistent postings; search/index core is unchanged.
+- Unified macOS sidebar, compact rounded search field, Finder-like result columns, quieter empty/loading states.
+- Keeps the complete diagnostic status bar: index status, total latency, result count, route, candidates, checked, capped state, lookup/match/rank timing, index path and keyboard shortcuts.
+- Index Status remains available from both the sidebar and bottom status bar with item count, index size/location, open/rebuild/clear controls.

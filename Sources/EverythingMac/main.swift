@@ -300,81 +300,32 @@ final class SearchModel {
 struct ContentView: View {
     @Bindable var model: SearchModel
     @FocusState private var searchFocused: Bool
+    @State private var selectedSection = "search"
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundStyle(.secondary)
-
-                TextField("Search files…  ext:pdf  kind:image  path:Downloads", text: $model.query)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 20))
-                    .focused($searchFocused)
-                    .onChange(of: model.query) { _, _ in model.queryChanged() }
-
-                if !model.query.isEmpty {
-                    Button {
-                        model.query = ""
-                        model.queryChanged()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                }
-            }
-            .padding(.horizontal, 18)
-            .frame(height: 62)
+        HStack(spacing: 0) {
+            SidebarView(model: model, selectedSection: $selectedSection)
+                .frame(width: 206)
+                .background(.ultraThinMaterial)
 
             Divider()
 
-            if !model.sessionStarted {
-                StartupIndexView(model: model)
-                Divider()
-            } else if model.isIndexBusy {
-                IndexProgressView(model: model)
-                Divider()
-            }
+            VStack(spacing: 0) {
+                SearchHeader(model: model, searchFocused: $searchFocused)
+                Divider().opacity(0.55)
 
-            List(selection: $model.selectedID) {
-                ForEach(model.results) { result in
-                    ResultRow(result: result)
-                        .tag(result.id)
-                        .contentShape(Rectangle())
-                        .onTapGesture(count: 2) { model.open(result) }
-                        .contextMenu {
-                            Button("Open") { model.open(result) }
-                            Button("Quick Look") {
-                                model.selectedID = result.id
-                                model.quickLookSelected()
-                            }
-                            Button("Reveal in Finder") { model.reveal(result) }
-                        }
+                if model.isIndexBusy {
+                    IndexProgressView(model: model)
+                    Divider().opacity(0.55)
                 }
-            }
-            .listStyle(.plain)
 
-            Divider()
-            HStack(spacing: 12) {
-                Button { model.showIndexDetails = true } label: {
-                    HStack(spacing: 5) { Image(systemName: "externaldrive.fill"); Text(model.status) }
-                }.buttonStyle(.plain)
-                Spacer()
-                if model.fullScan { Text("⚠ FULL SCAN").foregroundStyle(.red).fontWeight(.bold) }
-                else if model.slowQuery { Text(String(format: "⚠ Slow %.1f ms", model.searchLatencyMS)).foregroundStyle(.orange).fontWeight(.semibold) }
-                else { Text(String(format: "%.1f ms", model.searchLatencyMS)) }
-                Text("\(model.results.count) results")
-                Text("\(model.searchRoute) • \(model.candidateCount.formatted()) cand • \(model.examinedCount.formatted()) checked" + (model.candidateTruncated ? " • capped" : ""))
-                Text(String(format: "lookup %.2f • match %.2f • rank %.2f ms", model.lookupMS, model.matchMS, model.rankMS))
-                Text("⌥Space summon  ↑↓ select  ↩ open  ⌘↩ reveal  ⌘Y preview")
+                ResultsPane(model: model)
+                Divider().opacity(0.55)
+                StatusBar(model: model)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 14)
-            .frame(height: 30)
+            .background(Color(nsColor: .windowBackgroundColor))
         }
+        .frame(minWidth: 900, minHeight: 560)
         .onAppear { focusSearchSoon() }
         .onReceive(NotificationCenter.default.publisher(for: .everythingFocusSearch)) { _ in focusSearchSoon() }
         .onReceive(NotificationCenter.default.publisher(for: .everythingMoveSelection)) { note in
@@ -396,35 +347,296 @@ struct ContentView: View {
     }
 }
 
+struct SidebarView: View {
+    @Bindable var model: SearchModel
+    @Binding var selectedSection: String
 
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("EverythingMac")
+                .font(.system(size: 17, weight: .semibold))
+                .padding(.horizontal, 16)
+                .padding(.top, 18)
+                .padding(.bottom, 20)
 
-struct StartupIndexView: View {
+            SidebarCaption("INDEX")
+            SidebarAction(icon: "externaldrive", title: "Load Existing Index", active: !model.sessionStarted) {
+                model.loadExistingIndex()
+            }
+            SidebarAction(icon: "folder.badge.gearshape", title: "Choose Index Folder…") {
+                model.chooseIndexFolder()
+            }
+            SidebarAction(icon: "cylinder.split.1x2", title: "Build New Index") {
+                model.buildNewIndex()
+            }
+
+            Divider().padding(.horizontal, 12).padding(.vertical, 12)
+            SidebarCaption("BROWSE")
+            SidebarAction(icon: "magnifyingglass", title: "Search", active: selectedSection == "search") {
+                selectedSection = "search"
+                NotificationCenter.default.post(name: .everythingFocusSearch, object: nil)
+            }
+            SidebarAction(icon: "clock", title: "Recent", enabled: false) { }
+            SidebarAction(icon: "gearshape", title: "Settings", enabled: false) { }
+
+            Spacer()
+
+            Button { model.showIndexDetails = true } label: {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(model.searchReady ? Color.green : (model.isIndexBusy ? Color.orange : Color.secondary.opacity(0.55)))
+                        .frame(width: 7, height: 7)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Index Status").font(.caption.weight(.medium))
+                        Text(indexSummary).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(12)
+        }
+    }
+
+    private var indexSummary: String {
+        if model.searchReady { return "Ready • \(model.progressCompleted.formatted()) items" }
+        if model.isIndexBusy { return model.status }
+        return model.progressCompleted > 0 ? "\(model.progressCompleted.formatted()) items" : "Not loaded"
+    }
+}
+
+struct SidebarCaption: View {
+    let title: String
+    init(_ title: String) { self.title = title }
+    var body: some View {
+        Text(title)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(.tertiary)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 5)
+    }
+}
+
+struct SidebarAction: View {
+    let icon: String
+    let title: String
+    var active = false
+    var enabled = true
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 9) {
+                Image(systemName: icon).frame(width: 18)
+                Text(title).lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .font(.system(size: 13, weight: active ? .medium : .regular))
+            .padding(.horizontal, 11)
+            .frame(height: 32)
+            .background(active ? Color.accentColor.opacity(0.16) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.45)
+        .padding(.horizontal, 7)
+    }
+}
+
+struct SearchHeader: View {
+    @Bindable var model: SearchModel
+    var searchFocused: FocusState<Bool>.Binding
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(.secondary)
+                TextField("Search files and folders", text: $model.query)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 17))
+                    .focused(searchFocused)
+                    .onChange(of: model.query) { _, _ in model.queryChanged() }
+                if !model.query.isEmpty {
+                    Button {
+                        model.query = ""
+                        model.queryChanged()
+                    } label: { Image(systemName: "xmark.circle.fill") }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 13)
+            .frame(height: 42)
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(searchFocused.wrappedValue ? Color.accentColor.opacity(0.8) : Color(nsColor: .separatorColor).opacity(0.45), lineWidth: searchFocused.wrappedValue ? 1.5 : 1)
+            }
+            .shadow(color: .black.opacity(0.035), radius: 1, y: 1)
+
+            HStack(spacing: 8) {
+                Circle().fill(model.searchReady ? Color.green : Color.secondary.opacity(0.5)).frame(width: 6, height: 6)
+                Text(model.searchReady ? "Search ready" : model.status)
+                    .lineLimit(1)
+                Spacer()
+                if model.searchReady && !model.query.isEmpty {
+                    Text("route: \(model.searchRoute)")
+                    Text("•")
+                    Text("checked: \(model.examinedCount.formatted())")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 16)
+        .padding(.bottom, 11)
+    }
+}
+
+struct ResultsPane: View {
+    @Bindable var model: SearchModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Text("Name").frame(maxWidth: .infinity, alignment: .leading)
+                Text("Path").frame(maxWidth: .infinity, alignment: .leading)
+                Text("Size").frame(width: 86, alignment: .trailing)
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 16)
+            .frame(height: 29)
+            .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
+
+            Divider().opacity(0.45)
+
+            if !model.sessionStarted {
+                EmptyIndexState(model: model)
+            } else if model.results.isEmpty {
+                VStack(spacing: 8) {
+                    Spacer()
+                    Image(systemName: model.query.isEmpty ? "magnifyingglass" : "doc.text.magnifyingglass")
+                        .font(.system(size: 30, weight: .light)).foregroundStyle(.tertiary)
+                    Text(model.query.isEmpty ? "Start typing to search" : "No matching files or folders")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(selection: $model.selectedID) {
+                    ForEach(model.results) { result in
+                        ResultRow(result: result)
+                            .tag(result.id)
+                            .contentShape(Rectangle())
+                            .onTapGesture(count: 2) { model.open(result) }
+                            .contextMenu {
+                                Button("Open") { model.open(result) }
+                                Button("Quick Look") { model.selectedID = result.id; model.quickLookSelected() }
+                                Button("Reveal in Finder") { model.reveal(result) }
+                            }
+                    }
+                }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+            }
+        }
+    }
+}
+
+struct EmptyIndexState: View {
     @Bindable var model: SearchModel
     var body: some View {
-        VStack(alignment:.leading,spacing:14) {
-            Text("Index Session").font(.title2.bold())
-            Text("Debug mode does not scan or rebuild automatically. Load an existing index, choose another index folder, or explicitly build a new one.").foregroundStyle(.secondary)
-            HStack(spacing:12) {
+        VStack(spacing: 12) {
+            Spacer()
+            Image(systemName: "externaldrive.badge.magnifyingglass")
+                .font(.system(size: 34, weight: .light)).foregroundStyle(.tertiary)
+            Text("Load an index to begin")
+                .font(.headline)
+            Text("EverythingMac only searches file and folder names.\nIt does not search file contents.")
+                .multilineTextAlignment(.center).font(.callout).foregroundStyle(.secondary)
+            HStack {
                 Button("Load Existing Index") { model.loadExistingIndex() }.buttonStyle(.borderedProminent)
-                Button("Choose Index Folder…") { model.chooseIndexFolder() }
-                Button("Build New Index") { model.buildNewIndex() }
+                Button("Build New Index") { model.buildNewIndex() }.buttonStyle(.bordered)
             }
-            if !model.indexStoragePath.isEmpty {
-                Text(model.indexStoragePath).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+struct StatusBar: View {
+    @Bindable var model: SearchModel
+
+    var body: some View {
+        VStack(spacing: 2) {
+            HStack(spacing: 9) {
+                Button { model.showIndexDetails = true } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "externaldrive.fill")
+                        Text(model.status).lineLimit(1)
+                    }
+                }
+                .buttonStyle(.plain)
+                .help("Index Status")
+
+                Spacer(minLength: 10)
+
+                if model.fullScan {
+                    Text("⚠ FULL SCAN").foregroundStyle(.red).fontWeight(.bold)
+                } else if model.slowQuery {
+                    Text(String(format: "⚠ Slow %.1f ms", model.searchLatencyMS)).foregroundStyle(.orange).fontWeight(.semibold)
+                } else {
+                    Text(String(format: "%.1f ms", model.searchLatencyMS))
+                }
+                Text("\(model.results.count) results")
+                Text("\(model.searchRoute) • \(model.candidateCount.formatted()) cand • \(model.examinedCount.formatted()) checked" + (model.candidateTruncated ? " • capped" : ""))
+                Text(String(format: "lookup %.2f • match %.2f • rank %.2f ms", model.lookupMS, model.matchMS, model.rankMS))
             }
-        }.padding(22).frame(maxWidth:.infinity,alignment:.leading)
+
+            HStack {
+                if !model.indexStoragePath.isEmpty {
+                    Text("Index: \(model.indexStoragePath)").lineLimit(1).truncationMode(.middle)
+                } else {
+                    Text("Index not loaded")
+                }
+                Spacer()
+                Text("⌥Space summon   ↑↓ select   ↩ open   ⌘↩ reveal   ⌘Y preview")
+            }
+        }
+        .font(.system(size: 10.5))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .frame(height: 40)
+        .background(.bar)
     }
 }
 
 struct IndexProgressView: View {
     @Bindable var model: SearchModel
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack { Text(phaseTitle).font(.headline); Spacer(); Text(model.progressCompleted.formatted()).monospacedDigit() }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(phaseTitle).font(.callout.weight(.medium))
+                Spacer()
+                Text(model.progressCompleted.formatted()).monospacedDigit().foregroundStyle(.secondary)
+            }
             if let f = model.progressFraction { ProgressView(value: f) } else { ProgressView() }
-            HStack { Text(model.currentIndexPath.isEmpty ? "Discovering files and folders…" : model.currentIndexPath).lineLimit(1).truncationMode(.middle); Spacer(); if let total=model.progressTotal { Text("\(model.progressCompleted.formatted()) / \(total.formatted())") } }
-                .font(.caption).foregroundStyle(.secondary)
-        }.padding(.horizontal, 18).padding(.vertical, 12)
+            HStack {
+                Text(model.currentIndexPath.isEmpty ? "Preparing index…" : model.currentIndexPath).lineLimit(1).truncationMode(.middle)
+                Spacer()
+                if let total=model.progressTotal { Text("\(model.progressCompleted.formatted()) / \(total.formatted())") }
+            }
+            .font(.caption2).foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 18).padding(.vertical, 10)
+        .background(Color.accentColor.opacity(0.035))
     }
     private var phaseTitle:String { switch model.indexPhase { case .idle:"Idle";case .loading:"Loading persisted index";case .scanning:"Scanning files & folders";case .building:"Building search index";case .saving:"Saving index";case .ready:"Index ready" } }
 }
@@ -433,15 +645,29 @@ struct IndexDetailsView: View {
     @Bindable var model: SearchModel
     @Environment(\.dismiss) private var dismiss
     var body: some View {
-        VStack(alignment:.leading,spacing:16) {
-            HStack { Text("Index Status").font(.title2.bold()); Spacer(); Button("Done"){dismiss()} }
-            Grid(alignment:.leading,horizontalSpacing:18,verticalSpacing:10) {
-                GridRow { Text("Status").foregroundStyle(.secondary); Text(model.indexPhase == .ready ? "Up to date" : model.status) }
-                GridRow { Text("Items").foregroundStyle(.secondary); Text(model.progressCompleted.formatted()) }
-                GridRow { Text("Index size").foregroundStyle(.secondary); Text(ByteCountFormatter.string(fromByteCount:Int64(model.indexStorageBytes),countStyle:.file)) }
-                GridRow { Text("Index location").foregroundStyle(.secondary); Text(model.indexStoragePath).textSelection(.enabled) }
+        VStack(alignment:.leading,spacing:18) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Index Status").font(.title2.bold())
+                    Text("EverythingMac local filename index").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Done"){dismiss()}.keyboardShortcut(.defaultAction)
             }
-            HStack { Button("Open in Finder"){model.openIndexFolder()}; Spacer(); Button("Rebuild Index"){dismiss();model.rebuildRequested()}; Button("Clear & Rebuild",role:.destructive){dismiss();model.clearAndRebuild()} }
+            Divider()
+            Grid(alignment:.leading,horizontalSpacing:22,verticalSpacing:12) {
+                GridRow { Text("Status").foregroundStyle(.secondary); Label(model.indexPhase == .ready ? "Up to date" : model.status, systemImage: model.searchReady ? "checkmark.circle.fill" : "circle.dotted") }
+                GridRow { Text("Items").foregroundStyle(.secondary); Text(model.progressCompleted.formatted()).monospacedDigit() }
+                GridRow { Text("Index size").foregroundStyle(.secondary); Text(ByteCountFormatter.string(fromByteCount:Int64(model.indexStorageBytes),countStyle:.file)) }
+                GridRow { Text("Index location").foregroundStyle(.secondary); Text(model.indexStoragePath).textSelection(.enabled).lineLimit(2) }
+            }
+            Divider()
+            HStack {
+                Button("Open in Finder"){model.openIndexFolder()}
+                Spacer()
+                Button("Rebuild Index"){dismiss();model.rebuildRequested()}
+                Button("Clear & Rebuild",role:.destructive){dismiss();model.clearAndRebuild()}
+            }
         }.padding(22).frame(width:620)
     }
 }
@@ -451,27 +677,32 @@ struct ResultRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: result.record.isDirectory ? "folder.fill" : "doc.fill")
-                .font(.system(size: 22))
-                .frame(width: 28)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(result.record.name)
-                    .lineLimit(1)
-                Text(result.record.path)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+            HStack(spacing: 9) {
+                Image(systemName: result.record.isDirectory ? "folder.fill" : "doc.fill")
+                    .font(.system(size: 17))
+                    .foregroundStyle(result.record.isDirectory ? Color.accentColor : Color.secondary)
+                    .frame(width: 22)
+                Text(result.record.name).lineLimit(1)
             }
-            Spacer()
-            if !result.record.isDirectory {
-                Text(ByteCountFormatter.string(fromByteCount: Int64(result.record.size), countStyle: .file))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(result.record.path)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(result.record.isDirectory ? "Folder" : ByteCountFormatter.string(fromByteCount: Int64(result.record.size), countStyle: .file))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 86, alignment: .trailing)
         }
-        .padding(.vertical, 4)
+        .padding(.horizontal, 4)
+        .frame(minHeight: 34)
     }
 }
+
 #else
 import Foundation
 import EverythingCore
