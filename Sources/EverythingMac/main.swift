@@ -163,76 +163,80 @@ final class GlobalHotKey {
     }
 }
 
+struct LiveFSEvent: Sendable {
+    let path: String
+    let flags: FSEventStreamEventFlags
+    let id: FSEventStreamEventId
+    var requiresRescan: Bool {
+        (flags & FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)) != 0 ||
+        (flags & FSEventStreamEventFlags(kFSEventStreamEventFlagUserDropped)) != 0 ||
+        (flags & FSEventStreamEventFlags(kFSEventStreamEventFlagKernelDropped)) != 0
+    }
+}
+
 final class FSEventMonitor {
     private var stream: FSEventStreamRef?
-    private let path: String
-    private let callback: @Sendable ([String]) -> Void
+    private let paths: [String]
+    private let callback: @Sendable ([LiveFSEvent]) -> Void
+    private let queue = DispatchQueue(label: "EverythingMac.FSEvents", qos: .utility)
+    private(set) var running = false
 
-    init(path: String, callback: @escaping @Sendable ([String]) -> Void) {
-        self.path = path
+    init(paths: [String], callback: @escaping @Sendable ([LiveFSEvent]) -> Void) {
+        self.paths = paths
         self.callback = callback
     }
 
-    func start() {
-        guard stream == nil else { return }
+    @discardableResult func start() -> Bool {
+        guard stream == nil, !paths.isEmpty else { return running }
         let unmanagedSelf = Unmanaged.passUnretained(self)
-        var context = FSEventStreamContext(
-            version: 0,
-            info: unmanagedSelf.toOpaque(),
-            retain: nil,
-            release: nil,
-            copyDescription: nil
-        )
-
-        stream = FSEventStreamCreate(
+        var context = FSEventStreamContext(version: 0, info: unmanagedSelf.toOpaque(), retain: nil, release: nil, copyDescription: nil)
+        let created = FSEventStreamCreate(
             kCFAllocatorDefault,
-            { _, info, count, eventPaths, _, _ in
+            { _, info, count, eventPaths, eventFlags, eventIDs in
                 guard let info, count > 0 else { return }
                 let monitor = Unmanaged<FSEventMonitor>.fromOpaque(info).takeUnretainedValue()
-
-                // With kFSEventStreamCreateFlagUseCFTypes, eventPaths is a CFArray<CFString>.
-                // Do not reinterpret it as a C string array; doing so can silently drop events.
                 let cfPaths = Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue()
-                let nsPaths = cfPaths as NSArray
-                var paths: [String] = []
-                paths.reserveCapacity(count)
-                for item in nsPaths {
-                    if let path = item as? String { paths.append(path) }
+                var events: [LiveFSEvent] = []
+                events.reserveCapacity(count)
+                for i in 0..<count {
+                    guard let value = CFArrayGetValueAtIndex(cfPaths, i) else { continue }
+                    let cfString = unsafeBitCast(value, to: CFString.self)
+                    let path = cfString as String
+                    events.append(LiveFSEvent(path: path, flags: eventFlags[i], id: eventIDs[i]))
                 }
-
-                // We intentionally do not filter by item flags here. FSEvents can emit
-                // coalesced/root/drop-related events whose flag combinations differ by OS.
-                // Any touched path is cheap to reconcile, and this is much safer for a search index.
-                if !paths.isEmpty { monitor.callback(paths) }
+                if !events.isEmpty { monitor.callback(events) }
             },
             &context,
-            [path] as CFArray,
+            paths as CFArray,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            0.12,
-            FSEventStreamCreateFlags(
-                kFSEventStreamCreateFlagFileEvents |
-                kFSEventStreamCreateFlagUseCFTypes |
-                kFSEventStreamCreateFlagWatchRoot
-            )
+            0.10,
+            FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagWatchRoot | kFSEventStreamCreateFlagNoDefer)
         )
-
-        guard let stream else { return }
-        FSEventStreamSetDispatchQueue(
-            stream,
-            DispatchQueue(label: "EverythingMac.FSEvents", qos: .utility)
-        )
-        FSEventStreamStart(stream)
+        guard let created else { running = false; return false }
+        stream = created
+        FSEventStreamSetDispatchQueue(created, queue)
+        running = FSEventStreamStart(created)
+        if !running { FSEventStreamInvalidate(created); FSEventStreamRelease(created); stream = nil }
+        return running
     }
 
     func stop() {
-        guard let stream else { return }
-        FSEventStreamStop(stream)
-        FSEventStreamInvalidate(stream)
-        FSEventStreamRelease(stream)
-        self.stream = nil
+        guard let stream else { running = false; return }
+        if running { FSEventStreamStop(stream) }
+        FSEventStreamInvalidate(stream); FSEventStreamRelease(stream)
+        self.stream = nil; running = false
     }
-
     deinit { stop() }
+}
+
+struct IndexableVolume: Identifiable, Hashable {
+    let id: String
+    let url: URL
+    let name: String
+    let internalDrive: Bool
+    let removable: Bool
+    let capacity: Int64
+    var selected: Bool
 }
 
 @MainActor
@@ -240,11 +244,13 @@ final class FSEventMonitor {
 final class SearchModel {
     var query=""; var results:[SearchResult]=[]; var selectedID:UInt64?; var status="Choose an existing index or build a new one"
     var searchLatencyMS:Double=0; var indexPhase:IndexPhase = .idle; var progressCompleted=0; var progressTotal:Int?; var currentIndexPath=""
-    var indexStoragePath=""; var indexStorageBytes:UInt64=0; var showIndexDetails=false; var sessionStarted=false; var searchReady=false
+    var indexStoragePath=""; var indexStorageBytes:UInt64=0; var showIndexDetails=false; var showBuildConfirmation=false; var showVolumePicker=false; var sessionStarted=false; var searchReady=false
+    var volumes:[IndexableVolume]=[]; var monitoredRoots:[URL]=[]; var realtimeMonitoring=false; var lastRealtimeUpdate:Date?; var pendingRealtimeChanges=0
+    var fseventsHealth="Stopped"; var lastFSEventAt:Date?; var lastReconciledPath="—"; var realtimeAdded=0; var realtimeRemoved=0; var realtimeChanged=0; var lastFSEventID:UInt64=0
     var candidateCount=0; var examinedCount=0; var searchRoute="idle"; var candidateTruncated=false
     var lookupMS=0.0; var matchMS=0.0; var rankMS=0.0; var slowQuery=false; var fullScan=false
     private let index=IndexManager(); private var searchTask:Task<Void,Never>?; private var queryGeneration=0
-    private var fileEventTask:Task<Void,Never>?; private var monitor:FSEventMonitor?; private var pendingFileEventPaths=Set<String>(); private var liveChangeBatches=0
+    private var fileEventTask:Task<Void,Never>?; private var monitor:FSEventMonitor?; private var pendingFileEventPaths=Set<String>(); private var liveChangeBatches=0; private var realtimeNeedsRebuild=false
 
     init(){ Task { await inspectDefaultIndex() } }
     var progressFraction:Double?{guard let t=progressTotal,t>0 else{return nil};return min(1,Double(progressCompleted)/Double(t))}
@@ -258,17 +264,31 @@ final class SearchModel {
     private func loadSelectedIndex() async {
         sessionStarted=true; searchReady=false; results=[]
         let root=FileManager.default.homeDirectoryForCurrentUser
+        let savedRoots=(await index.persistedInfo)?.rootPaths?.map{URL(fileURLWithPath:$0,isDirectory:true)} ?? [root]
         let ok=await index.loadPersisted(root:root,progress:progressHandler)
         guard ok else { indexPhase = .idle; status="No valid index found at selected location"; sessionStarted=false; return }
         let count=await index.indexedCount; indexStorageBytes=await index.storageSizeBytes; indexStoragePath=await index.storagePath
-        searchReady=true; status="Search ready • \(count.formatted()) items • filesystem rescan off (debug)"
+        searchReady=true; monitoredRoots=savedRoots; startLiveMonitors(roots:monitoredRoots); status="Search ready • \(count.formatted()) items • realtime monitoring on"
     }
     func chooseIndexFolder(){
         let panel=NSOpenPanel(); panel.canChooseDirectories=true; panel.canChooseFiles=false; panel.allowsMultipleSelection=false; panel.prompt="Use Index"
         if panel.runModal() == NSApplication.ModalResponse.OK, let u = panel.url { Task { await index.useStorageDirectory(u); indexStoragePath=await index.storagePath; indexStorageBytes=await index.storageSizeBytes; await inspectDefaultIndex() } }
     }
-    func buildNewIndex(){ sessionStarted=true; Task { await rebuild() } }
-    func rebuild() async { let root=FileManager.default.homeDirectoryForCurrentUser;searchReady=false;results=[];await index.rebuild(root:root,progress:progressHandler);let c=await index.indexedCount;indexStoragePath=await index.storagePath;indexStorageBytes=await index.storageSizeBytes;searchReady=true;status="Search ready • \(c.formatted()) items • filesystem rescan off (debug)" }
+    func buildNewIndex(){ showBuildConfirmation=true }
+    func prepareVolumeSelection(){
+        let keys:Set<URLResourceKey>=[.volumeNameKey,.volumeIsInternalKey,.volumeIsRemovableKey,.volumeTotalCapacityKey,.volumeIsReadOnlyKey]
+        let urls=FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys:Array(keys),options:[.skipHiddenVolumes]) ?? []
+        volumes=urls.compactMap { u in
+            guard let v=try? u.resourceValues(forKeys:keys), v.volumeIsReadOnly != true else{return nil}
+            let name=v.volumeName ?? u.lastPathComponent; if name.isEmpty{return nil}
+            let internalDrive=v.volumeIsInternal ?? false; let removable=v.volumeIsRemovable ?? false
+            return IndexableVolume(id:u.standardizedFileURL.path,url:u,name:name,internalDrive:internalDrive,removable:removable,capacity:Int64(v.volumeTotalCapacity ?? 0),selected:internalDrive)
+        }.sorted{ ($0.internalDrive ? 0:1,$0.name) < ($1.internalDrive ? 0:1,$1.name) }
+        showVolumePicker=true
+    }
+    func toggleVolume(_ id:String){ if let i=volumes.firstIndex(where:{$0.id==id}){volumes[i].selected.toggle()} }
+    func buildSelectedVolumes(){ let roots=volumes.filter{$0.selected}.map{$0.url}; guard !roots.isEmpty else{return}; showVolumePicker=false; sessionStarted=true; Task{await rebuild(roots:roots)} }
+    func rebuild(roots:[URL]?=nil) async { let chosen=roots ?? (monitoredRoots.isEmpty ? [FileManager.default.homeDirectoryForCurrentUser]:monitoredRoots); let hadReadyIndex=searchReady; if !hadReadyIndex { results=[] }; stopLiveMonitors();await index.rebuild(roots:chosen,progress:progressHandler);let c=await index.indexedCount;indexStoragePath=await index.storagePath;indexStorageBytes=await index.storageSizeBytes;monitoredRoots=chosen;searchReady=true;startLiveMonitors(roots:chosen);status="Search ready • \(c.formatted()) items • realtime monitoring on" }
     nonisolated private func progressHandler(_ p:IndexProgress){Task{@MainActor[weak self] in self?.applyProgress(p)}}
     private func applyProgress(_ p:IndexProgress){indexPhase=p.phase;progressCompleted=p.completed;progressTotal=p.total;currentIndexPath=p.currentPath;switch p.phase{case .idle:status="Idle";case .loading:status="Loading records…";case .scanning:status="Scanning… \(p.completed.formatted()) items";case .building:status="Building search engine… \(p.completed.formatted()) / \((p.total ?? 0).formatted())";case .saving:status="Saving index…";case .ready:status="Search ready • \(p.completed.formatted()) items"}}
     func openIndexFolder(){guard !indexStoragePath.isEmpty else{return};NSWorkspace.shared.open(URL(fileURLWithPath:indexStoragePath,isDirectory:true))}
@@ -294,8 +314,48 @@ final class SearchModel {
     func openSelected(){if let r=selectedResult{open(r)}};func revealSelected(){if let r=selectedResult{reveal(r)}}
     func quickLookSelected(){guard let r=selectedResult else{return};let p=Process();p.executableURL=URL(fileURLWithPath:"/usr/bin/qlmanage");p.arguments=["-p",r.record.path];try?p.run()}
     func escape(){if !query.isEmpty{query="";queryChanged()}else{NSApp.keyWindow?.orderOut(nil)}};func open(_ r:SearchResult){NSWorkspace.shared.open(URL(fileURLWithPath:r.record.path))};func reveal(_ r:SearchResult){NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath:r.record.path)])}
-    private func startLiveMonitor(root:URL){monitor?.stop();monitor=FSEventMonitor(path:root.path){[weak self]paths in Task{@MainActor[weak self]in self?.scheduleFileEventUpdate(paths)}};monitor?.start()}
-    private func scheduleFileEventUpdate(_ paths:[String]){pendingFileEventPaths.formUnion(paths);fileEventTask?.cancel();fileEventTask=Task{@MainActor[weak self]in try?await Task.sleep(for:.milliseconds(300));guard !Task.isCancelled,let self else{return};let b=Array(self.pendingFileEventPaths);self.pendingFileEventPaths.removeAll(keepingCapacity:true);guard !b.isEmpty else{return};let stats=await self.index.applyFileSystemChanges(paths:b,root:FileManager.default.homeDirectoryForCurrentUser);self.liveChangeBatches += 1;let c=await self.index.indexedCount;let d=stats.delta==0 ? "±0":(stats.delta>0 ? "+\(stats.delta)":"\(stats.delta)");self.status="Search ready • \(c.formatted()) items • \(self.liveChangeBatches) updates • \(d)";self.queryChanged()}}
+    private func startLiveMonitors(roots:[URL]) {
+        stopLiveMonitors(); realtimeNeedsRebuild=false
+        let paths = Array(Set(roots.map { $0.standardizedFileURL.path })).sorted()
+        guard !paths.isEmpty else { fseventsHealth="No volumes"; return }
+        let m = FSEventMonitor(paths: paths) { [weak self] events in
+            Task { @MainActor [weak self] in self?.receiveFSEvents(events) }
+        }
+        monitor = m
+        realtimeMonitoring = m.start()
+        fseventsHealth = realtimeMonitoring ? "Running" : "Failed to start"
+    }
+    private func stopLiveMonitors() {
+        monitor?.stop(); monitor=nil; realtimeMonitoring=false; fseventsHealth="Stopped"
+        fileEventTask?.cancel(); fileEventTask=nil; pendingFileEventPaths.removeAll(); pendingRealtimeChanges=0
+    }
+    private func receiveFSEvents(_ events:[LiveFSEvent]) {
+        guard !events.isEmpty else { return }
+        lastFSEventAt=Date(); lastFSEventID=UInt64(events.map(\.id).max() ?? 0)
+        if events.contains(where: \.requiresRescan) {
+            realtimeNeedsRebuild=true; fseventsHealth="Rescan required"; status="Index may be out of date • FSEvents requested a rescan"
+            return
+        }
+        fseventsHealth="Running"
+        scheduleFileEventUpdate(events.map(\.path))
+    }
+    private func scheduleFileEventUpdate(_ paths:[String]) {
+        guard !realtimeNeedsRebuild else { return }
+        pendingFileEventPaths.formUnion(paths); pendingRealtimeChanges=pendingFileEventPaths.count
+        fileEventTask?.cancel()
+        fileEventTask=Task { @MainActor [weak self] in
+            try? await Task.sleep(for:.milliseconds(250))
+            guard !Task.isCancelled, let self else { return }
+            let batch=Array(self.pendingFileEventPaths); self.pendingFileEventPaths.removeAll(keepingCapacity:true); self.pendingRealtimeChanges=0
+            guard !batch.isEmpty else { return }
+            let roots=self.monitoredRoots.isEmpty ? [FileManager.default.homeDirectoryForCurrentUser] : self.monitoredRoots
+            let stats=await self.index.applyFileSystemChanges(paths:batch,roots:roots)
+            self.liveChangeBatches += 1; self.lastRealtimeUpdate=Date(); self.lastReconciledPath=batch.count == 1 ? batch[0] : "\(batch.count) paths"
+            if stats.delta > 0 { self.realtimeAdded += stats.delta } else if stats.delta < 0 { self.realtimeRemoved += -stats.delta } else { self.realtimeChanged += 1 }
+            let c=await self.index.indexedCount; self.progressCompleted=c; let d=stats.delta == 0 ? "±0" : (stats.delta > 0 ? "+\(stats.delta)" : "\(stats.delta)")
+            self.status="Search ready • \(c.formatted()) items • realtime \(d)"; self.queryChanged()
+        }
+    }
 }
 struct ContentView: View {
     @Bindable var model: SearchModel
@@ -336,6 +396,8 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .everythingQuickLookSelection)) { _ in model.quickLookSelected() }
         .onReceive(NotificationCenter.default.publisher(for: .everythingEscape)) { _ in model.escape() }
         .sheet(isPresented: $model.showIndexDetails) { IndexDetailsView(model: model) }
+        .alert("Build a New Index?", isPresented: $model.showBuildConfirmation) { Button("Cancel", role: .cancel){}; Button("Choose Disks…"){ model.prepareVolumeSelection() } } message: { Text("EverythingMac will build a complete filename index for the disks you select. Your current index remains available until you confirm the new build.") }
+        .sheet(isPresented: $model.showVolumePicker) { VolumePickerView(model:model) }
     }
 
     private func focusSearchSoon() {
@@ -660,6 +722,13 @@ struct IndexDetailsView: View {
                 GridRow { Text("Items").foregroundStyle(.secondary); Text(model.progressCompleted.formatted()).monospacedDigit() }
                 GridRow { Text("Index size").foregroundStyle(.secondary); Text(ByteCountFormatter.string(fromByteCount:Int64(model.indexStorageBytes),countStyle:.file)) }
                 GridRow { Text("Index location").foregroundStyle(.secondary); Text(model.indexStoragePath).textSelection(.enabled).lineLimit(2) }
+                GridRow { Text("Realtime monitoring").foregroundStyle(.secondary); Text(model.realtimeMonitoring ? "On" : "Off") }
+                GridRow { Text("Pending changes").foregroundStyle(.secondary); Text(model.pendingRealtimeChanges.formatted()).monospacedDigit() }
+                GridRow { Text("Last update").foregroundStyle(.secondary); Text(model.lastRealtimeUpdate?.formatted(date:.omitted,time:.standard) ?? "—") }
+                GridRow { Text("FSEvents").foregroundStyle(.secondary); Text(model.fseventsHealth) }
+                GridRow { Text("Last event").foregroundStyle(.secondary); Text(model.lastFSEventAt?.formatted(date:.omitted,time:.standard) ?? "—") }
+                GridRow { Text("Last reconciled").foregroundStyle(.secondary); Text(model.lastReconciledPath).lineLimit(1).truncationMode(.middle) }
+                GridRow { Text("Realtime Δ").foregroundStyle(.secondary); Text("+\(model.realtimeAdded)  −\(model.realtimeRemoved)  ~\(model.realtimeChanged)").monospacedDigit() }
             }
             Divider()
             HStack {
@@ -669,6 +738,19 @@ struct IndexDetailsView: View {
                 Button("Clear & Rebuild",role:.destructive){dismiss();model.clearAndRebuild()}
             }
         }.padding(22).frame(width:620)
+    }
+}
+
+struct VolumePickerView: View {
+    @Bindable var model: SearchModel
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        VStack(alignment:.leading,spacing:16){
+            VStack(alignment:.leading,spacing:4){Text("Select Disks to Index").font(.title2.bold());Text("A full filename index will be created for every selected disk.").foregroundStyle(.secondary)}
+            Divider()
+            ScrollView { VStack(spacing:6){ ForEach(model.volumes){v in Button{model.toggleVolume(v.id)}label:{HStack(spacing:12){Image(systemName:v.selected ? "checkmark.circle.fill":"circle").foregroundStyle(v.selected ? Color.accentColor:.secondary);Image(systemName:v.internalDrive ? "internaldrive":"externaldrive");VStack(alignment:.leading){Text(v.name).foregroundStyle(.primary);Text(v.internalDrive ? "Internal disk":"External disk").font(.caption).foregroundStyle(.secondary)};Spacer();if v.capacity>0{Text(ByteCountFormatter.string(fromByteCount:v.capacity,countStyle:.file)).font(.caption).foregroundStyle(.secondary)}}.padding(10).background(Color(nsColor:.controlBackgroundColor),in:RoundedRectangle(cornerRadius:9))}.buttonStyle(.plain)}} }
+            Divider();HStack{Text("\(model.volumes.filter{$0.selected}.count) disks selected").font(.caption).foregroundStyle(.secondary);Spacer();Button("Cancel"){dismiss()};Button("Build Index"){model.buildSelectedVolumes()}.buttonStyle(.borderedProminent).disabled(!model.volumes.contains{$0.selected})}
+        }.padding(22).frame(width:560,height:430)
     }
 }
 

@@ -29,11 +29,13 @@ public final class SearchEngine: @unchecked Sendable {
     private var grams: [String: [Int]] = [:]
     private var charIndex: [Character: [Int]] = [:]
     private var extensionIndex: [String: [Int]] = [:]
+    private var active: [Bool] = []
+    private var slotByID: [UInt64: Int] = [:]
     public private(set) var lastDiagnostics = SearchDiagnostics(totalEntries: 0, candidateCount: 0, examinedCount: 0, truncated: false, route: "idle", lookupMS: 0, matchMS: 0, rankMS: 0, totalMS: 0, fullScan: false)
     private let maxCandidates = 20_000
 
     public init(records: [FileRecord] = []) { replaceIndex(with: records) }
-    public var count: Int { records.count }
+    public var count: Int { active.isEmpty ? records.count : active.lazy.filter { $0 }.count }
 
     /// v0.3.1: restore the already-built posting tables instead of rebuilding them
     /// from every filename on every launch. Records remain the source of result metadata.
@@ -49,6 +51,8 @@ public final class SearchEngine: @unchecked Sendable {
             self.grams = snapshot.grams
             self.charIndex = snapshot.charIndex
             self.extensionIndex = snapshot.extensionIndex
+            self.active = Array(repeating: true, count: records.count)
+            self.slotByID = Dictionary(uniqueKeysWithValues: records.enumerated().map { ($0.element.id, $0.offset) })
             return true
         } catch { return false }
     }
@@ -64,6 +68,8 @@ public final class SearchEngine: @unchecked Sendable {
 
     public func replaceIndex(with records: [FileRecord], progress: (@Sendable (Int, Int) -> Void)? = nil) {
         self.records = records
+        self.active = Array(repeating: true, count: records.count)
+        self.slotByID = Dictionary(uniqueKeysWithValues: records.enumerated().map { ($0.element.id, $0.offset) })
         exact.removeAll(keepingCapacity: true); prefix1.removeAll(keepingCapacity: true); prefix2.removeAll(keepingCapacity: true)
         grams.removeAll(keepingCapacity: true); charIndex.removeAll(keepingCapacity: true); extensionIndex.removeAll(keepingCapacity: true)
         for (i, record) in records.enumerated() {
@@ -99,6 +105,58 @@ public final class SearchEngine: @unchecked Sendable {
         progress?(records.count, records.count)
     }
 
+    /// Applies a small filesystem delta without rebuilding the million-record search index.
+    /// Removed slots become tombstones; new/changed records are appended and indexed in-place.
+    public func applyDelta(removedIDs: Set<UInt64>, upserts: [FileRecord]) {
+        for id in removedIDs {
+            guard let slot = slotByID.removeValue(forKey: id), slot < active.count, active[slot] else { continue }
+            active[slot] = false
+            removeRecordFromPostings(records[slot], slot: slot)
+        }
+        for record in upserts {
+            if let old = slotByID.removeValue(forKey: record.id), old < active.count, active[old] {
+                active[old] = false
+                removeRecordFromPostings(records[old], slot: old)
+            }
+            let slot = records.count
+            records.append(record); active.append(true); slotByID[record.id] = slot
+            addRecordToPostings(record, slot: slot)
+        }
+    }
+
+    private func addRecordToPostings(_ record: FileRecord, slot: Int) {
+        if !record.isDirectory, !record.fileExtension.isEmpty { insertSortedUnique(slot, into: &extensionIndex[record.fileExtension, default: []]) }
+        var aliases = [record.normalizedName]
+        if !record.pinyinCompact.isEmpty { aliases.append(record.pinyinCompact) }
+        if !record.pinyinInitials.isEmpty { aliases.append(record.pinyinInitials) }
+        var seenAliases = Set<String>()
+        for alias in aliases where !alias.isEmpty && seenAliases.insert(alias).inserted {
+            insertSortedUnique(slot, into: &exact[alias, default: []])
+            let chars = Array(alias)
+            if let first = chars.first { insertSortedUnique(slot, into: &prefix1[String(first), default: []]); insertSortedUnique(slot, into: &charIndex[first, default: []]) }
+            if chars.count >= 2 { insertSortedUnique(slot, into: &prefix2[String(chars[0...1]), default: []]) }
+            if chars.count >= 2 { var seen=Set<String>(); for start in 0...(chars.count-2) { let k="2:"+String(chars[start...start+1]); if seen.insert(k).inserted { insertSortedUnique(slot, into: &grams[k, default: []]) } } }
+            if chars.count >= 3 { var seen=Set<String>(); for start in 0...(chars.count-3) { let k="3:"+String(chars[start...start+2]); if seen.insert(k).inserted { insertSortedUnique(slot, into: &grams[k, default: []]) } } }
+        }
+    }
+
+    private func removeRecordFromPostings(_ record: FileRecord, slot: Int) {
+        if !record.isDirectory, !record.fileExtension.isEmpty { removeSorted(slot, from: &extensionIndex[record.fileExtension]) }
+        var aliases = [record.normalizedName]
+        if !record.pinyinCompact.isEmpty { aliases.append(record.pinyinCompact) }
+        if !record.pinyinInitials.isEmpty { aliases.append(record.pinyinInitials) }
+        var seenAliases=Set<String>()
+        for alias in aliases where !alias.isEmpty && seenAliases.insert(alias).inserted {
+            removeSorted(slot, from: &exact[alias]); let chars=Array(alias)
+            if let first=chars.first { removeSorted(slot, from:&prefix1[String(first)]); removeSorted(slot, from:&charIndex[first]) }
+            if chars.count >= 2 { removeSorted(slot, from:&prefix2[String(chars[0...1])]) }
+            if chars.count >= 2 { var seen=Set<String>(); for start in 0...(chars.count-2) { let k="2:"+String(chars[start...start+1]); if seen.insert(k).inserted { removeSorted(slot, from:&grams[k]) } } }
+            if chars.count >= 3 { var seen=Set<String>(); for start in 0...(chars.count-3) { let k="3:"+String(chars[start...start+2]); if seen.insert(k).inserted { removeSorted(slot, from:&grams[k]) } } }
+        }
+    }
+    private func insertSortedUnique(_ value:Int, into a: inout [Int]) { if a.last == value { return }; if a.last.map({$0 < value}) ?? true { a.append(value); return }; let i=a.partitioningIndex{$0 >= value}; if i==a.count || a[i] != value { a.insert(value,at:i) } }
+    private func removeSorted(_ value:Int, from a: inout [Int]?) { guard var x=a else{return}; if let i=x.firstIndex(of:value){x.remove(at:i)}; a = x.isEmpty ? nil : x }
+
     public func search(_ rawQuery: String, limit: Int = 100) -> [SearchResult] {
         let parsed = QueryParser.parse(rawQuery)
         var text = parsed.text
@@ -115,6 +173,7 @@ public final class SearchEngine: @unchecked Sendable {
         var out: [SearchResult] = []; out.reserveCapacity(min(limit, 128)); var examined = 0
         for i in selection.ids.prefix(maxCandidates) {
             if Task.isCancelled { break }
+            guard i < active.count, active[i] else { continue }
             examined += 1
             let record = records[i]
             var q = parsed
@@ -259,4 +318,8 @@ private enum PersistentPostingCodec {
         mutating func string()throws->String { let n=Int(try u32());let b=try bytes(n);guard let s=String(data:b,encoding:.utf8)else{throw CodecError.corrupt};return s }
         mutating func map()throws->[String:[Int]] { let count=Int(try u32());var m:[String:[Int]]=[:];m.reserveCapacity(count);for _ in 0..<count{let k=try string();let n=Int(try u32());var a:[Int]=[];a.reserveCapacity(n);for _ in 0..<n{a.append(Int(try u32()))};m[k]=a};return m }
     }
+}
+
+private extension Array where Element == Int {
+    func partitioningIndex(where predicate:(Int)->Bool)->Int { var l=0,r=count; while l<r { let m=(l+r)/2; if predicate(self[m]) { r=m } else { l=m+1 } }; return l }
 }

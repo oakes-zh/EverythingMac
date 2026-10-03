@@ -3,6 +3,7 @@ import Foundation
 public struct PersistedIndexInfo: Codable, Sendable {
     public let version: Int
     public let rootPath: String
+    public let rootPaths: [String]?
     public let itemCount: Int
     public let savedAt: Date
 }
@@ -44,9 +45,17 @@ public struct IndexStorage: Sendable {
     public func save(records: [FileRecord], root: URL) throws {
         try prepare()
         try BinaryRecordCodec.write(records, to: binaryRecordsURL)
-        let info = PersistedIndexInfo(version: 3, rootPath: root.standardizedFileURL.path, itemCount: records.count, savedAt: Date())
+        let info = PersistedIndexInfo(version: 4, rootPath: root.standardizedFileURL.path, rootPaths: [root.standardizedFileURL.path], itemCount: records.count, savedAt: Date())
         let j = JSONEncoder(); j.outputFormatting = [.prettyPrinted, .sortedKeys]; j.dateEncodingStrategy = .iso8601
         try j.encode(info).write(to: stateURL, options: .atomic)
+    }
+
+    public func save(records: [FileRecord], roots: [URL]) throws {
+        try prepare(); try BinaryRecordCodec.write(records, to: binaryRecordsURL)
+        let paths=roots.map{$0.standardizedFileURL.path}; let first=paths.first ?? "/"
+        let info=PersistedIndexInfo(version:4,rootPath:first,rootPaths:paths,itemCount:records.count,savedAt:Date())
+        let j=JSONEncoder(); j.outputFormatting=[.prettyPrinted,.sortedKeys]; j.dateEncodingStrategy = .iso8601
+        try j.encode(info).write(to:stateURL,options:.atomic)
     }
 
     /// Loads records.bin when present. A v0.2.x records.plist is still accepted and is

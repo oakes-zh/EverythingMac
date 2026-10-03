@@ -81,3 +81,23 @@ Core tests: 9 tests, 0 failures.
 - Unified macOS sidebar, compact rounded search field, Finder-like result columns, quieter empty/loading states.
 - Keeps the complete diagnostic status bar: index status, total latency, result count, route, candidates, checked, capped state, lookup/match/rank timing, index path and keyboard shortcuts.
 - Index Status remains available from both the sidebar and bottom status bar with item count, index size/location, open/rebuild/clear controls.
+
+## v0.4.0 — Disk Index + Realtime FSEvents
+- Build New Index now requires confirmation before any scan starts.
+- New indexes are selected by mounted disk/volume, not arbitrary folders.
+- Full build scans every selected volume; selected volume paths are persisted in index-state.json.
+- FSEvents monitoring starts after load/build for every indexed volume.
+- Realtime changes use incremental posting-list deltas; they do not rebuild the million-record SearchEngine.
+- File events update a single file directly; directory events reconcile only that subtree.
+- Index Status shows realtime monitoring, pending changes, and last update.
+- Existing query routes/ranking remain unchanged.
+
+
+## v0.4.1 Realtime Fix
+
+- FSEvents now uses one stream for all selected volumes and verifies that the stream actually starts.
+- File-level events are reconciled as O(1) path updates; a single file change no longer scans the 1.6M-record path dictionary.
+- Create / rename / delete deltas update SearchEngine postings in place.
+- Dropped/must-rescan FSEvents mark the index as potentially stale instead of silently pretending realtime is healthy.
+- Index Status exposes FSEvents health, last event, last reconciled path and realtime delta counters.
+- Search routes/ranking are unchanged from the fast v0.3/v0.4 baseline.

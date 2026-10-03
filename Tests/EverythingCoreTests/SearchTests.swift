@@ -156,3 +156,46 @@ extension SearchTests {
         XCTAssertEqual(restored.lastDiagnostics.route, "bigram")
     }
 }
+
+extension SearchTests {
+    func testIncrementalDeltaKeepsFastRoutes() {
+        let engine = SearchEngine(records: [record(1, "old.glb"), record(2, "模型.obj")])
+        engine.applyDelta(removedIDs: [1], upserts: [record(3, "new.glb"), record(4, "汽车模型.fbx")])
+        XCTAssertTrue(engine.search("old").isEmpty)
+        XCTAssertEqual(engine.search(".glb").map{$0.record.name}, ["new.glb"])
+        XCTAssertEqual(engine.lastDiagnostics.route, "extension")
+        XCTAssertTrue(engine.search("模型").contains{$0.record.name == "汽车模型.fbx"})
+        XCTAssertEqual(engine.lastDiagnostics.route, "bigram")
+    }
+}
+
+extension SearchTests {
+    func testIndexManagerRealtimeCreateRenameDelete() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("EverythingMac-live-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let manager = IndexManager()
+        await manager.rebuild(root: root)
+
+        let first = root.appendingPathComponent("realtime-test.glb")
+        try Data("x".utf8).write(to: first)
+        _ = await manager.applyFileSystemChanges(paths: [first.path], root: root)
+        var response = await manager.search("realtime-test")
+        XCTAssertEqual(response.results.first?.record.name, "realtime-test.glb")
+
+        let renamed = root.appendingPathComponent("汽车模型.glb")
+        try fm.moveItem(at: first, to: renamed)
+        _ = await manager.applyFileSystemChanges(paths: [first.path, renamed.path], root: root)
+        response = await manager.search("realtime-test")
+        XCTAssertTrue(response.results.isEmpty)
+        response = await manager.search("汽车模型")
+        XCTAssertEqual(response.results.first?.record.name, "汽车模型.glb")
+
+        try fm.removeItem(at: renamed)
+        _ = await manager.applyFileSystemChanges(paths: [renamed.path], root: root)
+        response = await manager.search("汽车模型")
+        XCTAssertTrue(response.results.isEmpty)
+    }
+}
